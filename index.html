@@ -38,13 +38,19 @@
 // ===================== SETTINGS YOU CAN TUNE =====================
 const BPM = 92;
 // A touch counts when the value rises above (baseline + margin).
-// margin = max(baseline * TOUCH_RATIO, TOUCH_MIN)
-const TOUCH_RATIO = 0.25;
-const TOUCH_MIN = 15;
+// Each fruit gets its OWN margin, measured during calibration:
+//   margin = max(noise * NOISE_K, baseline * TOUCH_RATIO, TOUCH_MIN) * SENSITIVITY[fruit]
+// Smaller numbers = more sensitive.
+const NOISE_K = 4;          // how many "noise widths" a touch must rise above
+const TOUCH_RATIO = 0.06;   // at least 6% above the untouched value
+const TOUCH_MIN = 6;        // and at least this much
+// Per-fruit fine tuning (order: tomato, pomegranate, persimmon, pear, lemon).
+// Lower a fruit's number (e.g. 0.6) if it is hard to trigger; raise it if it triggers by itself.
+const SENSITIVITY = [0.8, 0.8, 1, 0.6, 1];
 // A "strong" touch (holding hard, or two people holding hands) =
 // value above baseline + margin * STRONG_FACTOR
 const STRONG_FACTOR = 3;
-const CALIB_MS = 1500;   // how long to measure the "no touch" baseline
+const CALIB_MS = 2000;   // how long to measure the "no touch" baseline
 const DEBOUNCE_MS = 400; // ignore new touches for this long after one
 
 // Order MUST match the Arduino: tomato, pomegranate, persimmon, pear, lemon
@@ -59,7 +65,7 @@ const FRUITS = [
 
 const N = FRUITS.length;
 const state = FRUITS.map(() => ({
-  on:false, touching:false, strong:false, base:null, val:0, level:0,
+  on:false, touching:false, strong:false, base:null, val:0, level:0, m:TOUCH_MIN, since:0,
   last:0, ripples:[], pending:false
 }));
 let audioReady = false, calibrating = false, calibSamples = [];
@@ -235,7 +241,7 @@ function updateSour() {
 }
 
 // ===================== TOUCH LOGIC =====================
-function margin(s) { return Math.max(s.base * TOUCH_RATIO, TOUCH_MIN); }
+function margin(s) { return s.m; }
 
 function update(i, val) {
   const s = state[i];
@@ -246,13 +252,21 @@ function update(i, val) {
   const rise = s.val - s.base;
   const wasTouching = s.touching;
   // hysteresis: needs to rise above the margin to start, fall below 40% to end
-  s.touching = wasTouching ? rise > m * 0.4 : rise > m;
+  // a touch must stay above the margin for 2 readings in a row (ignores single spikes)
+  s.over = rise > m ? (s.over || 0) + 1 : 0;
+  s.touching = wasTouching ? rise > m * 0.4 : s.over >= 2;
   const wasStrong = s.strong;
   s.strong = s.touching && rise > m * STRONG_FACTOR;
   s.level = Math.max(0, Math.min(1, rise / (m * STRONG_FACTOR)));
-  // follow slow drift ONLY when clearly untouched, so a light touch
-  // cannot slowly push the baseline up and make the fruit "deaf"
-  if (rise < m * 0.3) s.base = s.base * 0.995 + s.val * 0.005;
+  // baseline follows DOWN quickly: if calibration happened while someone touched
+  // the fruit, or the reading drops later, the fruit does not stay "deaf"
+  if (rise < 0) s.base = s.base * 0.9 + s.val * 0.1;
+  // and follows UP slowly, only when clearly untouched
+  else if (rise < m * 0.3) s.base = s.base * 0.995 + s.val * 0.005;
+  // stuck: "touching" for over 8 s means the untouched level moved (wet fruit, wire moved)
+  const now = performance.now();
+  if (s.touching && !wasTouching) s.since = now;
+  if (s.touching && now - s.since > 8000) { s.base = s.val; s.touching = false; s.strong = false; }
   if (!wasTouching && s.touching) onTouchStart(i);
   if (wasStrong !== s.strong && i === 4) updateSour();
 }
@@ -271,7 +285,14 @@ function calibrate() {
   setTimeout(() => {
     calibrating = false;
     calibSamples.forEach((arr, i) => {
-      if (arr.length) state[i].base = arr.reduce((a, b) => a + b, 0) / arr.length;
+      if (!arr.length) return;
+      // median + MAD: robust, so a brief touch during calibration is ignored
+      const med = a => { const b = [...a].sort((x, y) => x - y), k = b.length >> 1; return b.length % 2 ? b.at(k) : (b.at(k - 1) + b.at(k)) / 2; };
+      const mean = med(arr);
+      const sd = 1.4826 * med(arr.map(v => Math.abs(v - mean)));
+      const s = state[i];
+      s.base = mean; s.val = mean; s.touching = false;
+      s.m = Math.max(sd * NOISE_K, mean * TOUCH_RATIO, TOUCH_MIN) * SENSITIVITY.at(i);
     });
     setStatus('ready');
   }, CALIB_MS);
@@ -352,7 +373,7 @@ document.getElementById('c').addEventListener('pointerdown', e => {
   held = i;
   const s = state[i];
   if (s.base === null) s.base = 100;
-  s.val = 0;                                   // skip smoothing for a crisp click
+  s.val = 0; s.over = 1;                       // skip smoothing for a crisp click
   update(i, s.base + margin(s) * 2);           // a normal touch
   holdTimer = setTimeout(() => { if (held === i) { s.val = 0; update(i, s.base + margin(s) * (STRONG_FACTOR + 1)); } }, HOLD_MS);
 });
@@ -370,8 +391,9 @@ document.addEventListener('keydown', e => {
   const i = Number(e.code.replace('Digit', '')) - 1;
   if (i >= 0 && i < N) {
     if (state[i].base === null) state[i].base = 100;
-    state[i].val = 0;
-    update(i, e.shiftKey ? 500 : 200);
+    const st = state[i];
+    st.val = 0; st.over = 1;
+    update(i, st.base + margin(st) * (e.shiftKey ? STRONG_FACTOR + 1 : 2));
   }
 });
 document.addEventListener('keyup', e => {

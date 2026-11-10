@@ -55,4 +55,4 @@ Arduino pin 2 ──[1 MΩ]──┬── pin 4 ── jumper wire into Tomato
 
 - Close the Arduino Serial Monitor before opening the page. Only one program can use the port.
 - Push the wire deep into the fruit, keep wires and fruits from touching each other, and keep the laptop plugged in for steadier readings.
-- If it is not sensitive enough, lower `TOUCH_RATIO` and `TOUCH_MIN` at the top of `index.html`.
+- Each fruit gets its own threshold from its noise during calibration. If one fruit is still hard to trigger, lower its number in `SENSITIVITY` at the top of `index.html` (e.g. `0.6` → `0.4`); raise it if the fruit triggers by itself. Press `D` to see each fruit's value and the `need` value.
