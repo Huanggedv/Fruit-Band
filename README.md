@@ -5,7 +5,7 @@
 ![Fruit Band](media/cover.jpg)
 
 ▶ **[Watch the demo video](media/fruit_band_demo.mp4)**
-▶ **[Play it in your browser](https://huanggedv.github.io/fruit-band/)** — no Arduino needed, just click the fruits
+▶ **[Play it in your browser](https://huanggedv.github.io/Fruit-Band/)** — no Arduino needed, just click the fruits
 
 Made for *Technology Design Foundations — Synthesis: Invent a Musical Instrument*.
 
