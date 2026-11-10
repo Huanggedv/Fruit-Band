@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fruit Band</title>
+<!-- Sound engine: Tone.js -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  html,body { margin:0; height:100%; background:#0e0d0c; overflow:hidden; cursor:default; }
+  canvas { display:block; width:100vw; height:100vh; touch-action:none; }
+  .mono { font-family:'Space Mono', ui-monospace, monospace; text-transform:uppercase; letter-spacing:0.28em; }
+  #intro { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    cursor:pointer; z-index:3; transition:opacity .6s; }
+  #intro span { color:#6b645c; font-size:12px; }
+  #intro:hover span { color:#f4efe8; }
+  #intro.gone { opacity:0; pointer-events:none; }
+  #toast { position:fixed; left:0; right:0; bottom:36px; text-align:center; color:#6b645c;
+    font-size:10px; transition:opacity .8s; opacity:0; }
+  #raw { position:fixed; bottom:16px; right:20px; color:#6b645c; font-size:11px; margin:0;
+    text-align:right; display:none; letter-spacing:0.05em; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="intro"><span class="mono">● click to play</span></div>
+<div id="toast" class="mono"></div>
+<pre id="raw" class="mono"></pre>
+<!--
+  Hidden keys:
+  Space = connect Arduino again   C = recalibrate   D = show / hide sensor numbers
+  1–5 = test touch without Arduino   Shift + 1–5 = strong touch
+-->
+
+
+<script>
+// ===================== SETTINGS YOU CAN TUNE =====================
+const BPM = 92;
+// A touch counts when the value rises above (baseline + margin).
+// margin = max(baseline * TOUCH_RATIO, TOUCH_MIN)
+const TOUCH_RATIO = 0.25;
+const TOUCH_MIN = 15;
+// A "strong" touch (holding hard, or two people holding hands) =
+// value above baseline + margin * STRONG_FACTOR
+const STRONG_FACTOR = 3;
+const CALIB_MS = 1500;   // how long to measure the "no touch" baseline
+const DEBOUNCE_MS = 400; // ignore new touches for this long after one
+
+// Order MUST match the Arduino: tomato, pomegranate, persimmon, pear, lemon
+const FRUITS = [
+  { name:'Tomato',      role:'Drums',  color:'#e8402f' },
+  { name:'Pomegranate', role:'Shaker', color:'#c9342b' },
+  { name:'Persimmon',   role:'Bass',   color:'#f2781e' },
+  { name:'Pear',        role:'Melody', color:'#c9a046' },
+  { name:'Lemon',       role:'Chords', color:'#f3dc4c' },
+];
+// ================================================================
+
+const N = FRUITS.length;
+const state = FRUITS.map(() => ({
+  on:false, touching:false, strong:false, base:null, val:0, level:0,
+  last:0, ripples:[], pending:false
+}));
+let audioReady = false, calibrating = false, calibSamples = [];
+let pulse = 0, saladTime = 0;
+let beatCount = 0, gotData = false, lineCount = 0;
+const toastEl = document.getElementById('toast');
+let toastTimer;
+function setStatus(t) {          // small message that fades away
+  toastEl.textContent = t; toastEl.style.opacity = 1;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.style.opacity = 0, 2200);
+}
+
+// ===================== SOUND =====================
+let master, parts = [], fx = {};
+
+function buildSound() {
+  const reverb = new Tone.Reverb({ decay: 2.8, wet: 0.22 }).toDestination();
+  master = new Tone.Gain(0.85).connect(reverb);
+  const comp = new Tone.Compressor(-18, 3);
+  master.disconnect(); master.connect(comp); comp.connect(reverb);
+
+  // one gain per fruit, starts silent
+  parts = FRUITS.map(() => new Tone.Gain(0).connect(master));
+
+  // --- Tomato: lo-fi drums ---
+  fx.kick = new Tone.MembraneSynth({ pitchDecay:0.05, octaves:6,
+    envelope:{ attack:0.001, decay:0.35, sustain:0 } }).connect(parts[0]);
+  fx.kick.volume.value = -2;
+  const snareFilter = new Tone.Filter(1800, 'bandpass').connect(parts[0]);
+  fx.snare = new Tone.NoiseSynth({ noise:{type:'white'},
+    envelope:{ attack:0.001, decay:0.16, sustain:0 } }).connect(snareFilter);
+  fx.snare.volume.value = -6;
+  const hatFilter = new Tone.Filter(8000, 'highpass').connect(parts[0]);
+  fx.hat = new Tone.NoiseSynth({ noise:{type:'white'},
+    envelope:{ attack:0.001, decay:0.03, sustain:0 } }).connect(hatFilter);
+  fx.hat.volume.value = -16;
+
+  // --- Pomegranate: seed shaker ---
+  fx.shakeFilter = new Tone.Filter(5500, 'bandpass').connect(parts[1]);
+  fx.shaker = new Tone.NoiseSynth({ noise:{type:'pink'},
+    envelope:{ attack:0.004, decay:0.05, sustain:0 } }).connect(fx.shakeFilter);
+  fx.shaker.volume.value = -10;
+
+  // --- Persimmon: soft round bass ---
+  fx.bass = new Tone.MonoSynth({ oscillator:{type:'triangle'},
+    filter:{ Q:1, type:'lowpass' }, filterEnvelope:{ attack:0.01, decay:0.2, sustain:0.4, baseFrequency:200, octaves:2 },
+    envelope:{ attack:0.01, decay:0.3, sustain:0.6, release:0.3 } }).connect(parts[2]);
+  fx.bass.volume.value = -4;
+
+  // --- Pear: bright marimba-like melody ---
+  const delay = new Tone.FeedbackDelay('8n.', 0.25).connect(parts[3]);
+  delay.wet.value = 0.25;
+  fx.mel = new Tone.Synth({ oscillator:{type:'sine'},
+    envelope:{ attack:0.002, decay:0.4, sustain:0.05, release:0.4 } }).connect(delay);
+  fx.mel.volume.value = -6;
+  fx.mel2 = new Tone.Synth({ oscillator:{type:'triangle'},
+    envelope:{ attack:0.002, decay:0.3, sustain:0, release:0.3 } }).connect(delay);
+  fx.mel2.volume.value = -14;
+
+  // --- Lemon: jazzy electric-piano chords (goes "sour" when strong) ---
+  fx.vibrato = new Tone.Vibrato(6, 0).connect(parts[4]);
+  fx.keys = new Tone.PolySynth(Tone.FMSynth, {
+    harmonicity: 3, modulationIndex: 1.5,
+    envelope:{ attack:0.01, decay:1.0, sustain:0.25, release:1.2 },
+    modulationEnvelope:{ attack:0.01, decay:0.5, sustain:0.2, release:0.8 }
+  }).connect(fx.vibrato);
+  fx.keys.volume.value = -14;
+
+  // --- One-shot "fruit voices" (always audible, straight to master) ---
+  fx.pop = new Tone.MembraneSynth({ pitchDecay:0.02, octaves:4,
+    envelope:{ attack:0.001, decay:0.12, sustain:0 } }).connect(master);
+  fx.blip = new Tone.Synth({ oscillator:{type:'sine'},
+    envelope:{ attack:0.001, decay:0.15, sustain:0, release:0.1 } }).connect(master);
+  fx.blip.volume.value = -6;
+  fx.rattle = new Tone.NoiseSynth({ noise:{type:'white'},
+    envelope:{ attack:0.001, decay:0.02, sustain:0 } }).connect(fx.shakeFilter);
+  fx.crash = new Tone.NoiseSynth({ noise:{type:'white'},
+    envelope:{ attack:0.001, decay:1.2, sustain:0 } }).connect(hatFilter);
+
+  // ---------------- Music: 4 bars, D minor jazz (Dm9 - G13 - Cmaj9 - A7) ----------------
+  // bass: walking quarter notes
+  const BASS = ['D2','F2','A2','C3',  'G2','B2','D3','F2',  'C2','E2','G2','B2',  'A2','C#3','E3','G2'];
+  // chords per bar
+  const CHORDS = [ ['F3','A3','C4','E4'], ['F3','B3','E4','A4'], ['E3','G3','B3','D4'], ['G3','C#4','E4','A4'] ];
+  // melody: step (0-15 inside the bar) -> note
+  const MEL = [
+    {0:'A4', 3:'C5', 6:'D5', 8:'F5', 11:'E5', 14:'D5'},
+    {0:'D5', 3:'B4', 6:'G4', 10:'A4', 12:'B4'},
+    {0:'C5', 2:'E5', 6:'G5', 8:'E5', 12:'D5', 14:'C5'},
+    {0:'E5', 4:'C#5', 6:'A4', 10:'G4', 12:'E4'},
+  ];
+  const KICK  = [1,0,0,0, 0,0,0,1, 0,0,1,0, 0,0,0,0];
+  const SNARE = [0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0];
+  const SHAKE = [0.9,0.3,0.6,0.3, 0.9,0.3,0.6,0.4, 0.9,0.3,0.6,0.3, 0.9,0.4,0.7,0.5];
+
+  let step = 0;
+  new Tone.Loop(time => {
+    const s = step % 16, bar = Math.floor(step / 16) % 4;
+    const st = i => state[i].strong;
+
+    // Tomato drums (strong = drum fill)
+    if (KICK[s] || (st(0) && s % 4 === 2)) fx.kick.triggerAttackRelease('C1', '8n', time);
+    if (SNARE[s] || (st(0) && s >= 12)) fx.snare.triggerAttackRelease('16n', time, st(0) && s >= 12 ? 0.6 : 1);
+    if (s % 2 === 0) fx.hat.triggerAttackRelease('32n', time, s % 4 === 0 ? 0.9 : 0.5);
+
+    // Pomegranate shaker (strong = seeds burst: louder + extra random hits)
+    fx.shaker.triggerAttackRelease('32n', time, st(1) ? 1 : SHAKE[s] * 0.8);
+    if (st(1) && Math.random() < 0.6) fx.shaker.triggerAttackRelease('64n', time + Tone.Time('32n').toSeconds(), 0.7);
+
+    // Persimmon bass on every quarter (strong = jumps up an octave)
+    if (s % 4 === 0) {
+      const n = BASS[bar * 4 + s / 4];
+      fx.bass.triggerAttackRelease(st(2) ? Tone.Frequency(n).transpose(12) : n, '8n', time);
+    }
+
+    // Pear melody (strong = adds a sparkly octave on top)
+    const m = MEL[bar][s];
+    if (m) {
+      fx.mel.triggerAttackRelease(m, '8n', time);
+      if (st(3)) fx.mel2.triggerAttackRelease(Tone.Frequency(m).transpose(12), '16n', time);
+    }
+
+    // Lemon chords: long chord on beat 1, short stab on the "and" of 3
+    if (s === 0) fx.keys.triggerAttackRelease(CHORDS[bar], '2n', time, 0.8);
+    if (s === 10) fx.keys.triggerAttackRelease(CHORDS[bar], '16n', time, 0.5);
+
+    if (s % 4 === 0) Tone.Draw.schedule(() => { pulse = 1; beatCount++; }, time);
+    step++;
+  }, '16n').start(0);
+
+  Tone.Transport.bpm.value = BPM;
+  Tone.Transport.swingSubdivision = '16n';
+  Tone.Transport.swing = 0.22;
+}
+
+// short sound the moment a fruit is touched, so players get instant feedback
+function playVoice(i, turningOn) {
+  const now = Tone.now();
+  const up = turningOn;
+  switch (i) {
+    case 0: fx.pop.triggerAttackRelease(up ? 'G3' : 'C3', '16n', now); break;                 // tomato: "pop"
+    case 1: for (let k = 0; k < 6; k++) fx.rattle.triggerAttackRelease('64n', now + k * 0.035, 0.8); break; // pomegranate: seeds
+    case 2: fx.blip.triggerAttackRelease(up ? 'A2' : 'D2', '8n', now); break;                 // persimmon: soft "bloop"
+    case 3: fx.blip.triggerAttackRelease(up ? 'A6' : 'D6', '16n', now); break;                // pear: "ding"
+    case 4: fx.blip.frequency.cancelScheduledValues(now);                                    // lemon: sour squeak
+            fx.blip.triggerAttack(up ? 'E5' : 'B5', now);
+            fx.blip.frequency.exponentialRampTo(up ? 1400 : 500, 0.12, now);
+            fx.blip.triggerRelease(now + 0.14); break;
+  }
+}
+
+// turn a fruit's loop on/off, starting on the next beat so it stays in time
+function toggleFruit(i) {
+  const s = state[i];
+  s.on = !s.on; s.pending = true;
+  playVoice(i, s.on);
+  const t = Tone.Transport.nextSubdivision('4n');
+  Tone.Transport.scheduleOnce(time => {
+    parts[i].gain.rampTo(s.on ? 1 : 0, 0.05, time);
+    Tone.Draw.schedule(() => { s.pending = false; }, time);
+  }, t);
+  if (state.every(x => x.on)) {           // all five on = fruit salad!
+    fx.crash.triggerAttackRelease('1n', Tone.now(), 0.5);
+    saladTime = performance.now();
+  }
+}
+
+// lemon gets sour (wobbly, out of tune) when touched strongly
+function updateSour() {
+  if (!fx.vibrato) return;
+  fx.vibrato.depth.rampTo(state[4].strong ? 0.35 : 0, 0.1);
+}
+
+// ===================== TOUCH LOGIC =====================
+function margin(s) { return Math.max(s.base * TOUCH_RATIO, TOUCH_MIN); }
+
+function update(i, val) {
+  const s = state[i];
+  // smooth the raw number so one noisy reading cannot start or stop a touch
+  s.val = s.val ? s.val * 0.5 + val * 0.5 : val;
+  if (s.base === null) return;
+  const m = margin(s);
+  const rise = s.val - s.base;
+  const wasTouching = s.touching;
+  // hysteresis: needs to rise above the margin to start, fall below 40% to end
+  s.touching = wasTouching ? rise > m * 0.4 : rise > m;
+  const wasStrong = s.strong;
+  s.strong = s.touching && rise > m * STRONG_FACTOR;
+  s.level = Math.max(0, Math.min(1, rise / (m * STRONG_FACTOR)));
+  // follow slow drift ONLY when clearly untouched, so a light touch
+  // cannot slowly push the baseline up and make the fruit "deaf"
+  if (rise < m * 0.3) s.base = s.base * 0.995 + s.val * 0.005;
+  if (!wasTouching && s.touching) onTouchStart(i);
+  if (wasStrong !== s.strong && i === 4) updateSour();
+}
+
+function onTouchStart(i) {
+  const s = state[i], now = performance.now();
+  s.ripples.push({ t: now });
+  if (!audioReady || now - s.last < DEBOUNCE_MS) return;
+  s.last = now;
+  toggleFruit(i);
+}
+
+function calibrate() {
+  calibrating = true; calibSamples = FRUITS.map(() => []);
+  setStatus('calibrating · hands off');
+  setTimeout(() => {
+    calibrating = false;
+    calibSamples.forEach((arr, i) => {
+      if (arr.length) state[i].base = arr.reduce((a, b) => a + b, 0) / arr.length;
+    });
+    setStatus('ready');
+  }, CALIB_MS);
+}
+
+function handleLine(line) {
+  const nums = line.split(',').map(Number);
+  if (nums.length !== N || nums.some(isNaN)) return;
+  if (!gotData) { gotData = true; setStatus('arduino connected'); }
+  lineCount++;
+  document.getElementById('raw').textContent = `lines received ${lineCount}${calibrating ? '  · calibrating' : ''}\n` +
+    FRUITS.map((f, i) => {
+      const st = state[i];
+      if (st.base === null) return `${f.name}  ${nums[i]}`;
+      const need = Math.round(st.base + margin(st));
+      const bar = '|'.repeat(Math.max(0, Math.min(20, Math.round((nums[i] - st.base) / margin(st) * 10))));
+      return `${f.name}  ${nums[i]}  need ${need}  ${bar.padEnd(20, '.')}${st.touching ? ' ON' : ''}`;
+    }).join('\n');
+  if (calibrating) { nums.forEach((v, i) => calibSamples[i].push(v)); return; }
+  nums.forEach((v, i) => update(i, v));
+}
+
+// ===================== ARDUINO (Web Serial) =====================
+async function openPort(port) {
+  try {
+    await port.open({ baudRate: 9600 });
+    const decoder = new TextDecoderStream();
+    port.readable.pipeTo(decoder.writable);
+    const reader = decoder.readable.getReader();
+    setTimeout(calibrate, 500);
+    let buf = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += value;
+      const lines = buf.split('\n'); buf = lines.pop();
+      lines.forEach(l => {
+        try { handleLine(l.trim()); }               // one bad line must never stop reading
+        catch (err) { console.error(err); }
+      });
+    }
+  } catch (e) {
+    setStatus('port busy · close arduino serial monitor · then press space');
+  }
+}
+function connectArduino() {
+  if (!('serial' in navigator)) { setStatus('no arduino · click or tap the fruits to play'); return; }
+  navigator.serial.requestPort()
+    .then(openPort)
+    .catch(() => setStatus('no arduino · click or tap the fruits to play'));
+}
+
+// ===================== MOUSE / TOUCHSCREEN =====================
+// Click or tap a fruit = touch it (turns its loop on / off).
+// Hold it for 0.7 s = strong touch (special effect), like squeezing the real fruit.
+const HOLD_MS = 700;
+function fruitAt(e) {
+  const dpr = devicePixelRatio, x = e.clientX * dpr, y = e.clientY * dpr;
+  const W = cv.width, H = cv.height;
+  const gap = W / (N + 1), cy = H * 0.5, R = Math.min(gap * 0.3, H * 0.15);
+  for (let i = 0; i < N; i++) {
+    const dx = x - gap * (i + 1), dy = y - cy;
+    if (dx * dx + dy * dy < (R * 1.35) ** 2) return i;
+  }
+  return -1;
+}
+let held = -1, holdTimer = null;
+function release() {
+  clearTimeout(holdTimer);
+  if (held >= 0 && state[held].base !== null) { state[held].val = 0; update(held, state[held].base); }
+  held = -1;
+}
+document.getElementById('c').addEventListener('pointerdown', e => {
+  const i = fruitAt(e);
+  if (i < 0 || !audioReady) return;
+  e.preventDefault();
+  release();
+  held = i;
+  const s = state[i];
+  if (s.base === null) s.base = 100;
+  s.val = 0;                                   // skip smoothing for a crisp click
+  update(i, s.base + margin(s) * 2);           // a normal touch
+  holdTimer = setTimeout(() => { if (held === i) { s.val = 0; update(i, s.base + margin(s) * (STRONG_FACTOR + 1)); } }, HOLD_MS);
+});
+addEventListener('pointerup', release);
+addEventListener('pointercancel', release);
+document.getElementById('c').addEventListener('pointermove', e => { cv.style.cursor = fruitAt(e) >= 0 && audioReady ? 'pointer' : 'default'; });
+
+// ===================== KEYS =====================
+document.addEventListener('keydown', e => {
+  if (e.repeat) return;
+  const k = e.key.toLowerCase();
+  if (k === 'c') { calibrate(); return; }
+  if (k === 'd') { const r = document.getElementById('raw'); r.style.display = r.style.display === 'block' ? 'none' : 'block'; return; }
+  if (e.code === 'Space') { e.preventDefault(); if (audioReady) connectArduino(); return; }
+  const i = Number(e.code.replace('Digit', '')) - 1;
+  if (i >= 0 && i < N) {
+    if (state[i].base === null) state[i].base = 100;
+    state[i].val = 0;
+    update(i, e.shiftKey ? 500 : 200);
+  }
+});
+document.addEventListener('keyup', e => {
+  const i = Number(e.code.replace('Digit', '')) - 1;
+  if (i >= 0 && i < N && state[i].base !== null) { state[i].val = 0; update(i, state[i].base); }
+});
+
+// ===================== START (one click: sound + Arduino) =====================
+document.getElementById('intro').onclick = async () => {
+  if (audioReady) return;
+  document.getElementById('intro').classList.add('gone');
+  connectArduino();                 // port picker needs the click, so ask first
+  await Tone.start();
+  buildSound();
+  Tone.Transport.start('+0.1');
+  audioReady = true;
+};
+
+// ===================== VISUALS =====================
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+function resize() { cv.width = innerWidth * devicePixelRatio; cv.height = innerHeight * devicePixelRatio; }
+addEventListener('resize', resize); resize();
+
+// ---------- abstract fruit shapes (drawn in units where 1 = radius) ----------
+const LEAF = '#6f8f3a', STEM = '#6b4a2b', CALYX = '#9a9a45';
+function blob(x, y, rx, ry, rot = 0) { ctx.beginPath(); ctx.ellipse(x, y, rx, ry, rot, 0, Math.PI * 2); ctx.fill(); }
+
+const SHAPES = [
+  // 0 Tomato: wide round body + green star leaves + tiny stem
+  (c) => {
+    ctx.fillStyle = c; blob(0, 0.08, 1.05, 0.9);
+    ctx.fillStyle = LEAF;
+    for (let k = 0; k < 5; k++) {
+      const a = k * Math.PI * 2 / 5 + 0.3;
+      blob(Math.cos(a) * 0.2, -0.76 + Math.sin(a) * 0.09, 0.22, 0.06, a);
+    }
+    ctx.fillStyle = LEAF; ctx.fillRect(-0.04, -1.05, 0.08, 0.28);
+  },
+  // 1 Pomegranate: round body + spiky crown
+  (c) => {
+    ctx.fillStyle = c; blob(0, 0.1, 0.95, 0.92);
+    ctx.beginPath();
+    ctx.moveTo(-0.3, -0.72); ctx.lineTo(-0.36, -1.08); ctx.lineTo(-0.17, -0.92);
+    ctx.lineTo(0, -1.14); ctx.lineTo(0.17, -0.92); ctx.lineTo(0.36, -1.08); ctx.lineTo(0.3, -0.72);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = 'rgba(60,20,10,0.55)'; blob(0, -0.86, 0.14, 0.06);
+  },
+  // 2 Persimmon: slightly flat body + four square-ish leaves on top
+  (c) => {
+    ctx.fillStyle = c; blob(0, 0.08, 1.0, 0.84);
+    ctx.fillStyle = CALYX;
+    [-0.55, 0.55].forEach(dx => blob(dx * 0.55, -0.72, 0.3, 0.12, dx > 0 ? 0.35 : -0.35));
+    [-0.2, 0.2].forEach(dx => blob(dx, -0.8, 0.18, 0.13, dx > 0 ? -0.6 : 0.6));
+    ctx.fillStyle = STEM; blob(0, -0.82, 0.08, 0.08);
+  },
+  // 3 Pear: teardrop body + bent stem
+  (c) => {
+    ctx.fillStyle = c; ctx.beginPath();
+    ctx.moveTo(0, 1.02);
+    ctx.bezierCurveTo(-1.0, 1.02, -0.98, 0.12, -0.44, -0.12);
+    ctx.bezierCurveTo(-0.22, -0.26, -0.36, -0.86, 0, -0.86);
+    ctx.bezierCurveTo(0.36, -0.86, 0.22, -0.26, 0.44, -0.12);
+    ctx.bezierCurveTo(0.98, 0.12, 1.0, 1.02, 0, 1.02);
+    ctx.fill();
+    ctx.strokeStyle = STEM; ctx.lineWidth = 0.07; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(0, -0.84); ctx.quadraticCurveTo(0.02, -1.05, 0.2, -1.15); ctx.stroke();
+  },
+  // 4 Lemon: oval with pointed tips, tilted
+  (c) => {
+    ctx.save(); ctx.rotate(-0.25);
+    ctx.fillStyle = c; ctx.beginPath();
+    ctx.moveTo(-1.12, 0);
+    ctx.bezierCurveTo(-0.95, -0.82, 0.95, -0.82, 1.12, 0);
+    ctx.bezierCurveTo(0.95, 0.82, -0.95, 0.82, -1.12, 0);
+    ctx.fill();
+    blob(-1.12, 0, 0.1, 0.07); blob(1.12, 0, 0.1, 0.07);
+    ctx.restore();
+  },
+];
+
+// flat shine spot used on every fruit
+function shine() {
+  ctx.fillStyle = 'rgba(255,255,255,0.22)';
+  blob(-0.38, -0.28, 0.2, 0.12, -0.6);
+}
+
+function drawFruit(i, cx, cy, r, color, alpha, wobble, sx = 1, sy = 1) {
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(wobble);
+  ctx.scale(r * sx, r * sy);
+  // solid shapes; a fruit that is off is drawn darker instead of see-through
+  ctx.filter = alpha < 1 ? 'brightness(32%) saturate(60%)' : 'none';
+  SHAPES.at(i)(color);
+  ctx.restore();
+  ctx.filter = 'none';
+}
+
+function draw() {
+  const W = cv.width, H = cv.height, dpr = devicePixelRatio, now = performance.now();
+  pulse *= 0.86;
+  const allOn = state.every(s => s.on);
+
+  // background: near-black; all five on = flat colour flashes on every beat
+  ctx.fillStyle = allOn ? FRUITS.at(beatCount % N).color : '#0e0d0c';
+  ctx.fillRect(0, 0, W, H);
+  if (allOn) { ctx.fillStyle = 'rgba(14,13,12,' + (0.55 + 0.4 * (1 - pulse)) + ')'; ctx.fillRect(0, 0, W, H); }
+
+  const gap = W / (N + 1), cy = H * 0.5, R = Math.min(gap * 0.3, H * 0.15);
+  FRUITS.forEach((f, i) => {
+    const s = state[i], cx = gap * (i + 1);
+    const bounce = s.on ? pulse : 0;
+    const r = R * (1 + s.level * 0.18);
+
+    // flat shadow, squashes with the bounce
+    ctx.fillStyle = '#070606';
+    ctx.beginPath();
+    ctx.ellipse(cx, cy + R * 1.18, R * (0.85 - bounce * 0.15), R * 0.1, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // thin rings on each touch
+    s.ripples = s.ripples.filter(rp => now - rp.t < 900);
+    s.ripples.forEach(rp => {
+      const k = (now - rp.t) / 900;
+      ctx.strokeStyle = f.color; ctx.globalAlpha = 1 - k; ctx.lineWidth = 1.5 * dpr;
+      ctx.beginPath(); ctx.arc(cx, cy, r * (1.1 + k * 1.2), 0, Math.PI * 2); ctx.stroke();
+      ctx.globalAlpha = 1;
+    });
+
+    // the fruit: jumps up and stretches on the beat when it is playing
+    drawFruit(i, cx, cy - bounce * R * 0.22, r, f.color, s.on ? 1 : 0.35,
+      s.touching ? Math.sin(now / 40) * 0.06 : 0, 1 - bounce * 0.07, 1 + bounce * 0.09);
+
+    // strong touch: three dots orbit the fruit
+    if (s.strong) {
+      ctx.fillStyle = f.color;
+      for (let k = 0; k < 3; k++) {
+        const a = now / 260 + k * Math.PI * 2 / 3;
+        ctx.beginPath(); ctx.arc(cx + Math.cos(a) * r * 1.45, cy + Math.sin(a) * r * 1.45, 4 * dpr, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+
+    // name: tiny, spaced capitals; lights up in its own colour when on
+    ctx.textAlign = 'center';
+    ctx.fillStyle = s.on ? (allOn ? '#f4efe8' : f.color) : '#3b3631';
+    ctx.font = `400 ${10 * dpr}px 'Space Mono', ui-monospace, monospace`;
+    ctx.letterSpacing = `${3 * dpr}px`;
+    ctx.fillText(f.name.toUpperCase(), cx + 1.5 * dpr, cy + R * 1.62);
+    ctx.letterSpacing = '0px';
+  });
+
+  requestAnimationFrame(draw);
+}
+draw();
+</script>
+</body>
+</html>
