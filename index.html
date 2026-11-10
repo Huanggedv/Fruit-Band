@@ -30,6 +30,7 @@
 <!--
   Hidden keys:
   Space = connect Arduino again   C = recalibrate   D = show / hide sensor numbers
+  T = tune: press T, touch each fruit 2-3 times, press T again
   1–5 = test touch without Arduino   Shift + 1–5 = strong touch
 -->
 
@@ -293,6 +294,9 @@ function calibrate() {
       const s = state[i];
       s.base = mean; s.val = mean; s.touching = false;
       s.m = Math.max(sd * NOISE_K, mean * TOUCH_RATIO, TOUCH_MIN) * SENSITIVITY.at(i);
+      s.sd = sd;
+      const learned = loadTuned().at(i);
+      if (learned) s.m = Math.max(learned * TUNE_SHARE, sd * 2.5, 3);   // use what was learned with T
     });
     setStatus('ready');
   }, CALIB_MS);
@@ -312,7 +316,7 @@ function handleLine(line) {
       return `${f.name}  ${nums[i]}  need ${need}  ${bar.padEnd(20, '.')}${st.touching ? ' ON' : ''}`;
     }).join('\n');
   if (calibrating) { nums.forEach((v, i) => calibSamples[i].push(v)); return; }
-  nums.forEach((v, i) => update(i, v));
+  nums.forEach((v, i) => { tuneSample(i, v); if (!tuning) update(i, v); });
 }
 
 // ===================== ARDUINO (Web Serial) =====================
@@ -343,6 +347,39 @@ function connectArduino() {
   navigator.serial.requestPort()
     .then(openPort)
     .catch(() => setStatus('no arduino · click or tap the fruits to play'));
+}
+
+// ===================== TUNE MODE (press T) =====================
+// Press T, then touch each fruit firmly 2-3 times, then press T again.
+// The page measures how much each fruit really rises when touched and sets
+// that fruit's threshold to TUNE_SHARE of it. Saved in this browser.
+const TUNE_SHARE = 0.35;
+let tuning = false, tuneMax = [];
+function loadTuned() { try { return JSON.parse(localStorage.getItem('fruitTune') || '[]'); } catch (e) { return []; } }
+function saveTuned(a) { try { localStorage.setItem('fruitTune', JSON.stringify(a)); } catch (e) {} }
+function toggleTune() {
+  if (state.some(s => s.base === null)) { setStatus('connect the arduino first'); return; }
+  if (!tuning) {
+    tuning = true; tuneMax = FRUITS.map(() => 0);
+    toastEl.textContent = 'tuning · touch each fruit 2–3 times · then press T'; toastEl.style.opacity = 1;
+    clearTimeout(toastTimer);
+    return;
+  }
+  tuning = false;
+  const saved = loadTuned(), done = [];
+  state.forEach((s, i) => {
+    const rise = tuneMax.at(i);
+    if (rise > (s.sd || 1) * 3) {                    // only if it clearly rose above its noise
+      s.m = Math.max(rise * TUNE_SHARE, (s.sd || 1) * 2.5, 3);
+      saved[i] = rise; done.push(FRUITS.at(i).name.toLowerCase());
+    }
+  });
+  saveTuned(saved);
+  setStatus(done.length ? 'tuned · ' + done.join(' · ') : 'no rise found · check the wires');
+}
+function tuneSample(i, val) {
+  const s = state[i];
+  if (tuning && s.base !== null) tuneMax[i] = Math.max(tuneMax.at(i), val - s.base);
 }
 
 // ===================== MOUSE / TOUCHSCREEN =====================
@@ -386,6 +423,7 @@ document.addEventListener('keydown', e => {
   if (e.repeat) return;
   const k = e.key.toLowerCase();
   if (k === 'c') { calibrate(); return; }
+  if (k === 't') { toggleTune(); return; }
   if (k === 'd') { const r = document.getElementById('raw'); r.style.display = r.style.display === 'block' ? 'none' : 'block'; return; }
   if (e.code === 'Space') { e.preventDefault(); if (audioReady) connectArduino(); return; }
   const i = Number(e.code.replace('Digit', '')) - 1;

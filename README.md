@@ -33,7 +33,9 @@ All five loops share one song (lo-fi jazz, D minor, 92 BPM), and each loop start
 
 **With the fruits (Chrome or Edge):** connect the Arduino, open `index.html`, click **● click to play** and choose the Arduino's `usbmodem` port. Keep hands off the fruits for 1.5 s while it calibrates.
 
-Hidden keys: `Space` reconnect · `C` recalibrate · `D` show sensor numbers
+Hidden keys: `Space` reconnect · `C` recalibrate · `D` show sensor numbers · `T` tune
+
+**If a fruit is hard to trigger, use tune mode:** press `T`, touch each fruit firmly 2–3 times, then press `T` again. The page measures how much each fruit really rises when touched and sets its threshold from that. It is saved in the browser, so you only need to do it again if you change fruits or wiring.
 
 ## How it works
 
